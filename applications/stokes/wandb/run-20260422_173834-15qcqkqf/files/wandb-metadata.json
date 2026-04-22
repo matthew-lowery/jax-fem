@@ -1,0 +1,46 @@
+{
+  "os":  "macOS-14.4.1-arm64-arm-64bit",
+  "python":  "CPython 3.10.18",
+  "startedAt":  "2026-04-22T23:38:34.831317Z",
+  "args":  [
+    "--freeze-generator",
+    "--quiet-solver",
+    "--generator-objective=pred-div",
+    "--op-div-weight=1.",
+    "--epochs=100",
+    "--wandb"
+  ],
+  "program":  "/Users/mattlowery/Desktop/code/jax-fem/applications/stokes/stokes_kno_minimax_ad.py",
+  "codePath":  "applications/stokes/stokes_kno_minimax_ad.py",
+  "codePathLocal":  "stokes_kno_minimax_ad.py",
+  "git":  {
+    "remote":  "https://github.com/matthew-lowery/jax-fem.git",
+    "commit":  "0d767d1b686006781d21b98372936e58d6c49417"
+  },
+  "email":  "mattlowery10@gmail.com",
+  "root":  "/Users/mattlowery/Desktop/code/jax-fem/applications/stokes",
+  "host":  "MacBook-Pro-161.local",
+  "executable":  "/opt/homebrew/Caskroom/miniforge/base/envs/jax-fem-env/bin/python3",
+  "cpu_count":  16,
+  "cpu_count_logical":  16,
+  "disk":  {
+    "/":  {
+      "total":  "994662584320",
+      "used":  "701418127360"
+    }
+  },
+  "memory":  {
+    "total":  "51539607552"
+  },
+  "apple":  {
+    "name":  "Apple M3 Max",
+    "ecpuCores":  4,
+    "pcpuCores":  12,
+    "gpuCores":  40,
+    "memoryGb":  48,
+    "swapTotalBytes":  "6442450944",
+    "ramTotalBytes":  "51539607552",
+    "macModel":  "Mac15,9"
+  },
+  "writerId":  "hybyb59gw7zta5olxkq81po0vo3ewttg"
+}

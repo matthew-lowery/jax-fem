@@ -1,0 +1,116 @@
+_wandb:
+    value:
+        cli_version: 0.26.0
+        e:
+            hybyb59gw7zta5olxkq81po0vo3ewttg:
+                apple:
+                    ecpuCores: 4
+                    gpuCores: 40
+                    macModel: Mac15,9
+                    memoryGb: 48
+                    name: Apple M3 Max
+                    pcpuCores: 12
+                    ramTotalBytes: "51539607552"
+                    swapTotalBytes: "6442450944"
+                args:
+                    - --freeze-generator
+                    - --quiet-solver
+                    - --generator-objective=pred-div
+                    - --op-div-weight=1.
+                    - --epochs=100
+                    - --wandb
+                codePath: applications/stokes/stokes_kno_minimax_ad.py
+                codePathLocal: stokes_kno_minimax_ad.py
+                cpu_count: 16
+                cpu_count_logical: 16
+                disk:
+                    /:
+                        total: "994662584320"
+                        used: "701418127360"
+                email: mattlowery10@gmail.com
+                executable: /opt/homebrew/Caskroom/miniforge/base/envs/jax-fem-env/bin/python3
+                git:
+                    commit: 0d767d1b686006781d21b98372936e58d6c49417
+                    remote: https://github.com/matthew-lowery/jax-fem.git
+                host: MacBook-Pro-161.local
+                memory:
+                    total: "51539607552"
+                os: macOS-14.4.1-arm64-arm-64bit
+                program: /Users/mattlowery/Desktop/code/jax-fem/applications/stokes/stokes_kno_minimax_ad.py
+                python: CPython 3.10.18
+                root: /Users/mattlowery/Desktop/code/jax-fem/applications/stokes
+                startedAt: "2026-04-22T23:38:34.831317Z"
+                writerId: hybyb59gw7zta5olxkq81po0vo3ewttg
+        m:
+            - "1": epoch
+              "6":
+                - 3
+              "7": []
+            - "2": '*'
+              "5": 1
+              "6":
+                - 1
+              "7": []
+        python_version: 3.10.18
+        t:
+            "1":
+                - 12
+            "2":
+                - 12
+            "3":
+                - 7
+                - 61
+            "4": 3.10.18
+            "5": 0.26.0
+            "12": 0.26.0
+            "13": darwin-arm64
+batch:
+    value: 2
+boundary_quadrature_rule:
+    value: trapezoid
+depth:
+    value: 3
+epochs:
+    value: 100
+freeze_generator:
+    value: true
+gen_steps:
+    value: 1
+generator_objective:
+    value: pred-div
+heldout_batch:
+    value: 16
+heldout_seed:
+    value: 123
+kernel_jitter:
+    value: 0.001
+lift_dim:
+    value: 4
+lr_gen:
+    value: 0.0003
+lr_op:
+    value: 0.0003
+metrics_plot_path:
+    value: ""
+num_modes:
+    value: 8
+op_div_weight:
+    value: 1
+op_steps:
+    value: 10
+pred_div_chunk_size:
+    value: 512
+pred_div_include_boundary:
+    value: false
+pred_div_xi:
+    value: 3
+quiet_solver:
+    value: true
+seed:
+    value: 0
+wandb:
+    value: true
+wandb_name:
+    value: ""
+wandb_project:
+    value: stokes_kno_minimax
