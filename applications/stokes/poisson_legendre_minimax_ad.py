@@ -28,6 +28,7 @@ from poisson_legendre_operator import (
     rel_l2,
 )
 from poisson_legendre_solver_ad import PoissonSolutionSolver, build_problem, build_vertex_quadrature
+from poisson_transolver_operator import ScalarLegendreTransolver, build_transolver_filter
 from poisson_training_metric_plots import save_poisson_training_metrics_figure
 from training_wandb import finish_wandb_run, init_wandb_run, log_wandb_metrics
 
@@ -49,7 +50,21 @@ def maybe_quiet_solver(quiet):
         logger.setLevel(old_level)
 
 
-def build_model(*, legendre_degree, mesh_nx, mesh_ny, lift_dim, depth, kernel_jitter, quiet_solver, key):
+def build_model(
+    *,
+    legendre_degree,
+    mesh_nx,
+    mesh_ny,
+    lift_dim,
+    depth,
+    kernel_jitter,
+    operator_type,
+    transolver_heads,
+    transolver_slices,
+    transolver_mlp_ratio,
+    quiet_solver,
+    key,
+):
     key_sampler, key_operator = jr.split(key)
     multi_indices = generate_total_degree_multi_indices(legendre_degree, 2)
 
@@ -64,25 +79,44 @@ def build_model(*, legendre_degree, mesh_nx, mesh_ny, lift_dim, depth, kernel_ji
 
     vertex_locs, vertex_quadrature_w = build_vertex_quadrature(problem.fes[0])
     input_basis = legendre_vandermonde(vertex_locs, multi_indices)
-    head = PointSetKNOHead(
-        lift_dim=lift_dim,
-        depth=depth,
-        in_feats=vertex_locs.shape[1] + 1,
-        kernel_jitter=kernel_jitter,
-        key=key_operator,
-    )
-    model = PoissonLegendreMinimaxModel(
-        sampler=GaussianSampler(dim=input_basis.shape[1], key=key_sampler),
-        operator=ScalarLegendreKNO(
+    if operator_type == "kno":
+        head = PointSetKNOHead(
+            lift_dim=lift_dim,
+            depth=depth,
+            in_feats=vertex_locs.shape[1] + 1,
+            kernel_jitter=kernel_jitter,
+            key=key_operator,
+        )
+        operator = ScalarLegendreKNO(
             head=head,
             input_locs=vertex_locs,
             quadrature_locs=vertex_locs,
             quadrature_w=vertex_quadrature_w,
             input_basis=input_basis,
             output_locs=vertex_locs,
-        ),
+        )
+        operator_filter = build_operator_filter(operator)
+    elif operator_type == "transolver":
+        operator = ScalarLegendreTransolver(
+            input_locs=vertex_locs,
+            input_basis=input_basis,
+            output_locs=vertex_locs,
+            hidden_dim=lift_dim,
+            depth=depth,
+            heads=transolver_heads,
+            slice_num=transolver_slices,
+            mlp_ratio=transolver_mlp_ratio,
+            key=key_operator,
+        )
+        operator_filter = build_transolver_filter(operator)
+    else:
+        raise ValueError(f"Unsupported operator_type={operator_type}")
+
+    model = PoissonLegendreMinimaxModel(
+        sampler=GaussianSampler(dim=input_basis.shape[1], key=key_sampler),
+        operator=operator,
     )
-    return model, solver, multi_indices, solver_quad_locs
+    return model, solver, multi_indices, solver_quad_locs, operator_filter
 
 
 @eqx.filter_jit
@@ -139,14 +173,18 @@ def main():
     parser.add_argument("--lift-dim", type=int, default=8)
     parser.add_argument("--depth", type=int, default=3)
     parser.add_argument("--kernel-jitter", type=float, default=1e-3)
+    parser.add_argument("--operator-type", choices=("kno", "transolver"), default="transolver")
+    parser.add_argument("--transolver-heads", type=int, default=4)
+    parser.add_argument("--transolver-slices", type=int, default=32)
+    parser.add_argument("--transolver-mlp-ratio", type=int, default=1)
     parser.add_argument("--epochs", type=int, default=100)
     parser.add_argument("--gen-steps", type=int, default=1)
     parser.add_argument("--op-steps", type=int, default=10)
     parser.add_argument("--batch", type=int, default=2)
     parser.add_argument("--heldout-batch", type=int, default=16)
     parser.add_argument("--heldout-seed", type=int, default=123)
-    parser.add_argument("--lr-gen", type=float, default=3e-4)
-    parser.add_argument("--lr-op", type=float, default=3e-4)
+    parser.add_argument("--lr-gen", type=float, default=1e-3)
+    parser.add_argument("--lr-op", type=float, default=1e-3)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--quiet-solver", action="store_true")
     parser.add_argument("--freeze-generator", action="store_true")
@@ -157,13 +195,17 @@ def main():
     args = parser.parse_args()
 
     key = jr.PRNGKey(args.seed)
-    model, solver, multi_indices, solver_quad_locs = build_model(
+    model, solver, multi_indices, solver_quad_locs, operator_filter = build_model(
         legendre_degree=args.legendre_degree,
         mesh_nx=args.mesh_nx,
         mesh_ny=args.mesh_ny,
         lift_dim=args.lift_dim,
         depth=args.depth,
         kernel_jitter=args.kernel_jitter,
+        operator_type=args.operator_type,
+        transolver_heads=args.transolver_heads,
+        transolver_slices=args.transolver_slices,
+        transolver_mlp_ratio=args.transolver_mlp_ratio,
         quiet_solver=args.quiet_solver,
         key=key,
     )
@@ -171,7 +213,6 @@ def main():
     optimizer_sampler = optax.chain(optax.clip_by_global_norm(1.0), optax.adam(args.lr_gen))
     optimizer_operator = optax.chain(optax.clip_by_global_norm(1.0), optax.adam(args.lr_op))
     opt_state_sampler = optimizer_sampler.init(eqx.filter(model.sampler, eqx.is_array))
-    operator_filter = build_operator_filter(model.operator)
     opt_state_operator = optimizer_operator.init(eqx.filter(model.operator, operator_filter))
 
     heldout_eps = jr.normal(jr.PRNGKey(args.heldout_seed), (args.heldout_batch, multi_indices.shape[0]))
@@ -230,6 +271,7 @@ def main():
     startup_metrics = {
         "legendre_degree": int(args.legendre_degree),
         "basis_size": int(multi_indices.shape[0]),
+        "operator_type": args.operator_type,
         "source_quad_points": int(solver_quad_locs.shape[0]),
         "input_points": int(model.operator.input_locs.shape[0]),
         "solution_nodes": int(model.operator.output_locs.shape[0]),
@@ -241,6 +283,7 @@ def main():
         f"source_quad_points={startup_metrics['source_quad_points']}, "
         f"input_points={startup_metrics['input_points']}, "
         f"solution_nodes={startup_metrics['solution_nodes']}, "
+        f"operator_type={startup_metrics['operator_type']}, "
         f"legendre_degree={startup_metrics['legendre_degree']}, "
         f"mesh={startup_metrics['mesh_nx']}x{startup_metrics['mesh_ny']}"
     )
@@ -316,10 +359,15 @@ def main():
     config_lines = [
         f"legendre_degree={args.legendre_degree}",
         f"basis_size={multi_indices.shape[0]}",
+        f"operator_type={args.operator_type}",
         f"source_quad_points={solver_quad_locs.shape[0]}",
         f"vertex_points={model.operator.input_locs.shape[0]}",
         f"mesh_nx={args.mesh_nx}",
         f"mesh_ny={args.mesh_ny}",
+        f"lift_dim={args.lift_dim}",
+        f"depth={args.depth}",
+        f"transolver_heads={args.transolver_heads}",
+        f"transolver_slices={args.transolver_slices}",
         f"epochs={args.epochs}",
         f"gen_steps={args.gen_steps}",
         f"op_steps={args.op_steps}",
