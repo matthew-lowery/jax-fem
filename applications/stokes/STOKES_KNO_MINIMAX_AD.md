@@ -158,12 +158,12 @@ We changed the inner-loop semantics.
 Now each epoch:
 
 1. samples one latent batch `eps_batch`
-2. reuses that same batch for all `gen_steps`
-3. after generator updates, forms one operator batch from the current sampler
-4. solves the true PDE once for that operator batch
-5. reuses that fixed operator batch for all `op_steps`
+2. samples one coefficient batch from the current generator
+3. solves the true PDE once for that batch
+4. reuses that fixed batch for all `op_steps` operator updates
+5. performs one generator update on that same batch
 
-So `gen-steps` and `op-steps` are numbers of optimizer updates on a fixed sampled batch, not numbers of resampled batches.
+So `op-steps` is the only inner-loop repetition knob. The generator updates once per epoch.
 
 ## Batch arguments
 
@@ -280,4 +280,3 @@ python stokes_kno_minimax_ad.py \
 - `stokes_kno_minimax_ad.py`: current active implementation
 - `fourier_inflow_ad.py`: original Stokes solver used as teacher
 - `stokes_gp_neurop_minimax_ad.py`: earlier GP-neurop-based exploratory path, not the active one
-

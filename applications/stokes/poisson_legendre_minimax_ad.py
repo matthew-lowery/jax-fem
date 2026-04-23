@@ -178,7 +178,6 @@ def main():
     parser.add_argument("--transolver-slices", type=int, default=32)
     parser.add_argument("--transolver-mlp-ratio", type=int, default=1)
     parser.add_argument("--epochs", type=int, default=100)
-    parser.add_argument("--gen-steps", type=int, default=1)
     parser.add_argument("--op-steps", type=int, default=10)
     parser.add_argument("--batch", type=int, default=2)
     parser.add_argument("--heldout-batch", type=int, default=16)
@@ -235,7 +234,7 @@ def main():
         model = eqx.tree_at(lambda current_model: current_model.operator, model, operator)
         return model, opt_state, loss
 
-    def train_step_sampler(model, opt_state, eps_batch):
+    def train_step_sampler(model, opt_state, eps_batch, u_true_batch, solver_vjps):
         sampler_params, sampler_static = eqx.partition(model.sampler, eqx.is_array)
 
         def sample_from_params(current_params):
@@ -243,7 +242,6 @@ def main():
             return jax.vmap(current_sampler.sample_eps)(eps_batch)
 
         coefs_batch, sampler_vjp = jax.vjp(sample_from_params, sampler_params)
-        u_true_batch, solver_vjps = solve_batch_with_vjps(solver, coefs_batch, quiet_solver=args.quiet_solver)
         loss, grad_coefs_op, grad_u_true = loss_input_partials(model, coefs_batch, u_true_batch)
         with maybe_quiet_solver(args.quiet_solver):
             grad_coefs_solver = jnp.stack(
@@ -303,19 +301,25 @@ def main():
         op_loss = jnp.nan
         key, subkey = jr.split(key)
         eps_batch = jr.normal(subkey, (args.batch, multi_indices.shape[0]))
+        coefs_batch = sample_coefs_batch(model.sampler, eps_batch)
+        if args.freeze_generator:
+            u_true_batch = solve_batch(solver, coefs_batch, quiet_solver=args.quiet_solver)
+            solver_vjps = None
+        else:
+            u_true_batch, solver_vjps = solve_batch_with_vjps(solver, coefs_batch, quiet_solver=args.quiet_solver)
+        for _ in range(args.op_steps):
+            model, opt_state_operator, op_loss = train_step_operator(model, opt_state_operator, coefs_batch, u_true_batch)
 
         if args.freeze_generator:
-            current_coefs_batch = sample_coefs_batch(model.sampler, eps_batch)
-            current_u_true_batch = solve_batch(solver, current_coefs_batch, quiet_solver=args.quiet_solver)
-            gen_loss = mean_batch_loss(model, current_coefs_batch, current_u_true_batch)
+            gen_loss = mean_batch_loss(model, coefs_batch, u_true_batch)
         else:
-            for _ in range(args.gen_steps):
-                model, opt_state_sampler, gen_loss = train_step_sampler(model, opt_state_sampler, eps_batch)
-
-        op_coefs_batch = sample_coefs_batch(model.sampler, eps_batch)
-        op_u_true_batch = solve_batch(solver, op_coefs_batch, quiet_solver=args.quiet_solver)
-        for _ in range(args.op_steps):
-            model, opt_state_operator, op_loss = train_step_operator(model, opt_state_operator, op_coefs_batch, op_u_true_batch)
+            model, opt_state_sampler, gen_loss = train_step_sampler(
+                model,
+                opt_state_sampler,
+                eps_batch,
+                u_true_batch,
+                solver_vjps,
+            )
 
         heldout_mean, heldout_worst = eval_metrics(model, heldout_coefs, heldout_u_true)
         heldout_worst_best = jnp.minimum(heldout_worst_best, heldout_worst)
@@ -369,7 +373,7 @@ def main():
         f"transolver_heads={args.transolver_heads}",
         f"transolver_slices={args.transolver_slices}",
         f"epochs={args.epochs}",
-        f"gen_steps={args.gen_steps}",
+        "generator_updates_per_epoch=1",
         f"op_steps={args.op_steps}",
         f"batch={args.batch}",
         f"lr_gen={args.lr_gen}",

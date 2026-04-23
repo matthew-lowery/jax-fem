@@ -400,7 +400,6 @@ def main():
     parser.add_argument("--depth", type=int, default=3)
     parser.add_argument("--kernel-jitter", type=float, default=1e-3)
     parser.add_argument("--epochs", type=int, default=100)
-    parser.add_argument("--gen-steps", type=int, default=1)
     parser.add_argument("--op-steps", type=int, default=10)
     parser.add_argument("--batch", type=int, default=2)
     parser.add_argument("--heldout-batch", type=int, default=16)
@@ -482,7 +481,7 @@ def main():
         model = eqx.tree_at(lambda current_model: current_model.operator, model, operator)
         return model, opt_state, loss, rel_loss, div_loss
 
-    def train_step_sampler(model, opt_state, eps_batch):
+    def train_step_sampler(model, opt_state, eps_batch, u_true_batch, solver_vjps):
         sampler_params, sampler_static = eqx.partition(model.sampler, eqx.is_array)
 
         def sample_from_params(current_params):
@@ -490,7 +489,6 @@ def main():
             return jax.vmap(current_sampler.sample_eps)(eps_batch)
 
         coefs_batch, sampler_vjp = jax.vjp(sample_from_params, sampler_params)
-        u_true_batch, solver_vjps = solve_batch_with_vjps(solver, coefs_batch, quiet_solver=args.quiet_solver)
         loss, grad_coefs_op, grad_u_true = loss_input_partials(model, coefs_batch, u_true_batch)
 
         with maybe_quiet_solver(args.quiet_solver):
@@ -528,7 +526,6 @@ def main():
         model = eqx.tree_at(lambda current_model: current_model.sampler, model, sampler)
         return model, opt_state, mean_abs_div
 
-    heldout_mean_best = jnp.inf
     heldout_worst_best = jnp.inf
     heldout_div_worst_best = jnp.inf
     gen_metric_label = "gen_rel_l2" if args.generator_objective == "rel-l2" else "gen_pred_div_meanabs"
@@ -600,33 +597,38 @@ def main():
         op_div_loss = jnp.nan
         key, subkey = jr.split(key)
         eps_batch = jr.normal(subkey, (args.batch, args.num_modes))
-
-        if args.freeze_generator:
-            current_coefs_batch = sample_coefs_batch(model.sampler, eps_batch)
-            if args.generator_objective == "pred-div":
-                gen_loss, _ = pred_div_metrics(model, current_coefs_batch, divergence_operator, divergence_indices)
-            else:
-                current_u_true_batch = solve_batch(solver, current_coefs_batch, quiet_solver=args.quiet_solver)
-                gen_loss = mean_batch_loss(model, current_coefs_batch, current_u_true_batch)
+        coefs_batch = sample_coefs_batch(model.sampler, eps_batch)
+        if args.freeze_generator or args.generator_objective == "pred-div":
+            u_true_batch = solve_batch(solver, coefs_batch, quiet_solver=args.quiet_solver)
+            solver_vjps = None
         else:
-            for _ in range(args.gen_steps):
-                if args.generator_objective == "pred-div":
-                    model, opt_state_sampler, gen_loss = train_step_sampler_pred_div(model, opt_state_sampler, eps_batch)
-                else:
-                    model, opt_state_sampler, gen_loss = train_step_sampler(model, opt_state_sampler, eps_batch)
-
-        op_coefs_batch = sample_coefs_batch(model.sampler, eps_batch)
-        op_u_true_batch = solve_batch(solver, op_coefs_batch, quiet_solver=args.quiet_solver)
+            u_true_batch, solver_vjps = solve_batch_with_vjps(solver, coefs_batch, quiet_solver=args.quiet_solver)
         for _ in range(args.op_steps):
             model, opt_state_operator, op_loss, op_rel_loss, op_div_loss = train_step_operator(
                 model,
                 opt_state_operator,
-                op_coefs_batch,
-                op_u_true_batch,
+                coefs_batch,
+                u_true_batch,
             )
 
+        if args.freeze_generator:
+            if args.generator_objective == "pred-div":
+                gen_loss, _ = pred_div_metrics(model, coefs_batch, divergence_operator, divergence_indices)
+            else:
+                gen_loss = mean_batch_loss(model, coefs_batch, u_true_batch)
+        else:
+            if args.generator_objective == "pred-div":
+                model, opt_state_sampler, gen_loss = train_step_sampler_pred_div(model, opt_state_sampler, eps_batch)
+            else:
+                model, opt_state_sampler, gen_loss = train_step_sampler(
+                    model,
+                    opt_state_sampler,
+                    eps_batch,
+                    u_true_batch,
+                    solver_vjps,
+                )
+
         heldout_mean, heldout_worst = eval_metrics(model, heldout_coefs, heldout_u_true)
-        heldout_mean_best = jnp.minimum(heldout_mean_best, heldout_mean)
         heldout_worst_best = jnp.minimum(heldout_worst_best, heldout_worst)
         epoch_metrics = {
             "epoch": epoch,
@@ -708,7 +710,7 @@ def main():
         f"pred_div_region={'all' if args.pred_div_include_boundary else 'interior'}",
         f"boundary_quadrature_rule={args.boundary_quadrature_rule}",
         f"epochs={args.epochs}",
-        f"gen_steps={args.gen_steps}",
+        "generator_updates_per_epoch=1",
         f"op_steps={args.op_steps}",
         f"batch={args.batch}",
         f"lr_gen={args.lr_gen}",
