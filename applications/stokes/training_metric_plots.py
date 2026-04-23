@@ -90,7 +90,10 @@ def save_training_metrics_figure(
     )
     axes[6].set_title("Run Config")
 
-    axes[7].axis("off")
+    _plot_series(axes[7], epochs, history["heldout_fgsm_mean_rel_l2"], "heldout_fgsm_mean_rel_l2", color="#2563eb")
+    _plot_series(axes[7], epochs, history["heldout_fgsm_worst_rel_l2"], "heldout_fgsm_worst_rel_l2", color="#ea580c")
+    _plot_series(axes[7], epochs, history["heldout_fgsm_worst_rel_l2_best"], "heldout_fgsm_worst_best", color="#059669")
+    _finalize_axis(axes[7], "FGSM Held-Out Rel L2", "Relative Error")
 
     fig.suptitle("Stokes KNO Training Metrics", fontsize=18)
     fig.savefig(save_path, dpi=180, bbox_inches="tight")

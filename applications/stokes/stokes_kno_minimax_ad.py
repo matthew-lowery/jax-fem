@@ -19,6 +19,7 @@ import optax
 
 from div_stuff.rbf_fd_divergence import build_rbffd_divergence
 from local_kno_utils import create_lifted_module as clm
+from local_sampler_utils import build_sampler, sample_noise_batch, sampler_scale_mean
 from training_metric_plots import save_training_metrics_figure
 from training_wandb import finish_wandb_run, init_wandb_run, log_wandb_metrics
 
@@ -50,27 +51,6 @@ def rel_l2(y_true, y_pred):
     y_true = y_true.reshape(-1)
     y_pred = y_pred.reshape(-1)
     return jnp.linalg.norm(y_true - y_pred) / (jnp.linalg.norm(y_true) + 1e-12)
-
-
-class GaussianSampler(eqx.Module):
-    mu: jax.Array
-    raw_sig: jax.Array
-
-    def __init__(self, *, dim, key):
-        key_mu, key_sig = jr.split(key)
-        self.mu = 0.01 * jr.normal(key_mu, (dim,))
-        self.raw_sig = -2.0 + 0.1 * jr.normal(key_sig, (dim,))
-
-    @property
-    def sig(self):
-        return jax.nn.softplus(self.raw_sig)
-
-    def sample_eps(self, eps):
-        return self.mu + eps * self.sig
-
-    def rvs(self, key, shape):
-        eps = jr.normal(key, shape + self.mu.shape)
-        return self.sample_eps(eps)
 
 
 class MaternC2Kernel(eqx.Module):
@@ -274,6 +254,9 @@ def build_model(
     depth,
     kernel_jitter,
     boundary_quadrature_rule,
+    sampler_type,
+    sampler_components,
+    sampler_temperature,
     quiet_solver,
     key,
 ):
@@ -304,7 +287,13 @@ def build_model(
     )
 
     model = StokesKNOMinimaxModel(
-        sampler=GaussianSampler(dim=num_modes, key=key_sampler),
+        sampler=build_sampler(
+            sampler_type=sampler_type,
+            dim=num_modes,
+            key=key_sampler,
+            num_components=sampler_components,
+            temperature=sampler_temperature,
+        ),
         operator=VectorBoundaryKNO(
             heads=heads,
             boundary_locs=boundary_locs,
@@ -318,8 +307,8 @@ def build_model(
 
 
 @eqx.filter_jit
-def sample_coefs_batch(sampler, eps_batch):
-    return jax.vmap(sampler.sample_eps)(eps_batch)
+def sample_coefs_batch(sampler, noise_batch):
+    return jax.vmap(sampler.sample_eps)(noise_batch)
 
 
 @eqx.filter_jit
@@ -377,6 +366,15 @@ def operator_loss_terms(model, coefs_batch, u_true_batch, divergence_operator, d
     return rel_loss, div_loss
 
 
+@eqx.filter_jit
+def fgsm_attack_batch(model, coefs_batch, u_true_batch, epsilon):
+    grad_coefs = jax.vmap(jax.grad(lambda coefs, u_true: rel_l2(u_true, model.predict(coefs)), argnums=0))(
+        coefs_batch,
+        u_true_batch,
+    )
+    return coefs_batch + epsilon * jnp.sign(grad_coefs)
+
+
 def solve_batch(solver, coefs_batch, quiet_solver=False):
     with maybe_quiet_solver(quiet_solver):
         return jnp.stack([solver(coefs) for coefs in coefs_batch])
@@ -402,8 +400,15 @@ def main():
     parser.add_argument("--epochs", type=int, default=100)
     parser.add_argument("--op-steps", type=int, default=10)
     parser.add_argument("--batch", type=int, default=2)
+    parser.add_argument("--sampler-type", choices=("gaussian", "mog"), default="gaussian")
+    parser.add_argument("--sampler-components", type=int, default=4)
+    parser.add_argument("--sampler-temperature", type=float, default=1.0)
     parser.add_argument("--heldout-batch", type=int, default=16)
     parser.add_argument("--heldout-seed", type=int, default=123)
+    parser.add_argument("--eval-fgsm", action="store_true")
+    parser.add_argument("--fgsm-epsilon", type=float, default=0.0)
+    parser.add_argument("--fgsm-heldout-count", type=int, default=0)
+    parser.add_argument("--fgsm-eval-every", type=int, default=1)
     parser.add_argument("--lr-gen", type=float, default=1e-3)
     parser.add_argument("--lr-op", type=float, default=1e-3)
     parser.add_argument("--seed", type=int, default=0)
@@ -421,7 +426,8 @@ def main():
     parser.add_argument("--wandb-name", type=str, default="")
     args = parser.parse_args()
 
-    key = jr.PRNGKey(args.seed)
+    master_key = jr.PRNGKey(args.seed)
+    key_model, key_train = jr.split(master_key)
     build_solver_fn = load_build_solver(args.quiet_solver)
     model, solver = build_model(
         build_solver_fn=build_solver_fn,
@@ -430,8 +436,11 @@ def main():
         depth=args.depth,
         kernel_jitter=args.kernel_jitter,
         boundary_quadrature_rule=args.boundary_quadrature_rule,
+        sampler_type=args.sampler_type,
+        sampler_components=args.sampler_components,
+        sampler_temperature=args.sampler_temperature,
         quiet_solver=args.quiet_solver,
-        key=key,
+        key=key_model,
     )
 
     optimizer_sampler = optax.chain(optax.clip_by_global_norm(1.0), optax.adam(args.lr_gen))
@@ -453,9 +462,14 @@ def main():
             if args.pred_div_include_boundary
             else jnp.asarray(onp.flatnonzero(~onp.asarray(divergence_operator.boundary_mask)), dtype=jnp.int32)
         )
-    heldout_eps = jr.normal(jr.PRNGKey(args.heldout_seed), (args.heldout_batch, args.num_modes))
-    heldout_coefs = sample_coefs_batch(model.sampler, heldout_eps)
+    heldout_noise = sample_noise_batch(model.sampler, jr.PRNGKey(args.heldout_seed), args.heldout_batch)
+    heldout_coefs = sample_coefs_batch(model.sampler, heldout_noise)
     heldout_u_true = solve_batch(solver, heldout_coefs, quiet_solver=args.quiet_solver)
+    fgsm_enabled = args.eval_fgsm and args.fgsm_epsilon > 0.0 and args.fgsm_heldout_count > 0
+    fgsm_eval_every = max(1, args.fgsm_eval_every)
+    fgsm_count = min(args.fgsm_heldout_count, args.heldout_batch)
+    fgsm_clean_coefs = heldout_coefs[:fgsm_count]
+    fgsm_clean_u_true = heldout_u_true[:fgsm_count]
 
     @eqx.filter_jit
     def train_step_operator(model, opt_state, coefs_batch, u_true_batch):
@@ -481,12 +495,12 @@ def main():
         model = eqx.tree_at(lambda current_model: current_model.operator, model, operator)
         return model, opt_state, loss, rel_loss, div_loss
 
-    def train_step_sampler(model, opt_state, eps_batch, u_true_batch, solver_vjps):
+    def train_step_sampler(model, opt_state, noise_batch, u_true_batch, solver_vjps):
         sampler_params, sampler_static = eqx.partition(model.sampler, eqx.is_array)
 
         def sample_from_params(current_params):
             current_sampler = eqx.combine(current_params, sampler_static)
-            return jax.vmap(current_sampler.sample_eps)(eps_batch)
+            return jax.vmap(current_sampler.sample_eps)(noise_batch)
 
         coefs_batch, sampler_vjp = jax.vjp(sample_from_params, sampler_params)
         loss, grad_coefs_op, grad_u_true = loss_input_partials(model, coefs_batch, u_true_batch)
@@ -505,13 +519,13 @@ def main():
         return model, opt_state, loss
 
     @eqx.filter_jit
-    def train_step_sampler_pred_div(model, opt_state, eps_batch):
+    def train_step_sampler_pred_div(model, opt_state, noise_batch):
         sampler_params, sampler_static = eqx.partition(model.sampler, eqx.is_array)
 
         def mean_mean_abs_div_fn(current_params):
             current_sampler = eqx.combine(current_params, sampler_static)
             current_model = eqx.tree_at(lambda current_model: current_model.sampler, model, current_sampler)
-            coefs_batch = jax.vmap(current_sampler.sample_eps)(eps_batch)
+            coefs_batch = jax.vmap(current_sampler.sample_eps)(noise_batch)
             mean_abs_div, _ = pred_div_metrics(current_model, coefs_batch, divergence_operator, divergence_indices)
             return mean_abs_div
 
@@ -528,6 +542,7 @@ def main():
 
     heldout_worst_best = jnp.inf
     heldout_div_worst_best = jnp.inf
+    fgsm_worst_best = jnp.inf
     gen_metric_label = "gen_rel_l2" if args.generator_objective == "rel-l2" else "gen_pred_div_meanabs"
     op_metric_label = "op_rel_l2" if args.op_div_weight == 0.0 else "op_total_loss"
     history = {
@@ -539,6 +554,9 @@ def main():
         "heldout_mean_rel_l2": [],
         "heldout_worst_rel_l2": [],
         "heldout_worst_rel_l2_best": [],
+        "heldout_fgsm_mean_rel_l2": [],
+        "heldout_fgsm_worst_rel_l2": [],
+        "heldout_fgsm_worst_rel_l2_best": [],
         "heldout_mean_pred_div_meanabs": [],
         "heldout_worst_pred_div_meanabs": [],
         "heldout_worst_pred_div_meanabs_best": [],
@@ -550,6 +568,10 @@ def main():
         "boundary_quad_points": int(model.operator.quadrature_locs.shape[0]),
         "velocity_nodes": int(model.operator.output_locs.shape[0]),
         "sampler_dim": int(args.num_modes),
+        "sampler_type": args.sampler_type,
+        "sampler_components": int(model.sampler.num_components),
+        "fgsm_enabled": fgsm_enabled,
+        "fgsm_eval_every": fgsm_eval_every,
         "generator_objective": args.generator_objective,
         "op_div_weight": float(args.op_div_weight),
         "boundary_quadrature_rule": args.boundary_quadrature_rule,
@@ -559,6 +581,10 @@ def main():
         f"boundary_quad_points={startup_metrics['boundary_quad_points']}, "
         f"velocity_nodes={startup_metrics['velocity_nodes']}, "
         f"sampler_dim={startup_metrics['sampler_dim']}, "
+        f"sampler_type={startup_metrics['sampler_type']}, "
+        f"sampler_components={startup_metrics['sampler_components']}, "
+        f"fgsm_enabled={startup_metrics['fgsm_enabled']}, "
+        f"fgsm_eval_every={startup_metrics['fgsm_eval_every']}, "
         f"generator_objective={startup_metrics['generator_objective']}, "
         f"op_div_weight={startup_metrics['op_div_weight']}, "
         f"boundary_quadrature_rule={startup_metrics['boundary_quadrature_rule']}"
@@ -595,9 +621,9 @@ def main():
         op_loss = jnp.nan
         op_rel_loss = jnp.nan
         op_div_loss = jnp.nan
-        key, subkey = jr.split(key)
-        eps_batch = jr.normal(subkey, (args.batch, args.num_modes))
-        coefs_batch = sample_coefs_batch(model.sampler, eps_batch)
+        key_train, subkey = jr.split(key_train)
+        noise_batch = sample_noise_batch(model.sampler, subkey, args.batch)
+        coefs_batch = sample_coefs_batch(model.sampler, noise_batch)
         if args.freeze_generator or args.generator_objective == "pred-div":
             u_true_batch = solve_batch(solver, coefs_batch, quiet_solver=args.quiet_solver)
             solver_vjps = None
@@ -618,18 +644,26 @@ def main():
                 gen_loss = mean_batch_loss(model, coefs_batch, u_true_batch)
         else:
             if args.generator_objective == "pred-div":
-                model, opt_state_sampler, gen_loss = train_step_sampler_pred_div(model, opt_state_sampler, eps_batch)
+                model, opt_state_sampler, gen_loss = train_step_sampler_pred_div(model, opt_state_sampler, noise_batch)
             else:
                 model, opt_state_sampler, gen_loss = train_step_sampler(
                     model,
                     opt_state_sampler,
-                    eps_batch,
+                    noise_batch,
                     u_true_batch,
                     solver_vjps,
                 )
 
         heldout_mean, heldout_worst = eval_metrics(model, heldout_coefs, heldout_u_true)
         heldout_worst_best = jnp.minimum(heldout_worst_best, heldout_worst)
+        fgsm_mean = jnp.nan
+        fgsm_worst = jnp.nan
+        fgsm_should_eval = fgsm_enabled and (epoch % fgsm_eval_every == 0)
+        if fgsm_should_eval:
+            fgsm_adv_coefs = fgsm_attack_batch(model, fgsm_clean_coefs, fgsm_clean_u_true, args.fgsm_epsilon)
+            fgsm_adv_u_true = solve_batch(solver, fgsm_adv_coefs, quiet_solver=args.quiet_solver)
+            fgsm_mean, fgsm_worst = eval_metrics(model, fgsm_adv_coefs, fgsm_adv_u_true)
+            fgsm_worst_best = jnp.minimum(fgsm_worst_best, fgsm_worst)
         epoch_metrics = {
             "epoch": epoch,
             gen_metric_label: float(gen_loss),
@@ -637,8 +671,16 @@ def main():
             "heldout_mean_rel_l2": float(heldout_mean),
             "heldout_worst_rel_l2": float(heldout_worst),
             "heldout_worst_best": float(heldout_worst_best),
-            "sig_mean": float(model.sampler.sig.mean()),
+            "sig_mean": float(sampler_scale_mean(model.sampler)),
         }
+        if fgsm_should_eval:
+            epoch_metrics.update(
+                {
+                    "heldout_fgsm_mean_rel_l2": float(fgsm_mean),
+                    "heldout_fgsm_worst_rel_l2": float(fgsm_worst),
+                    "heldout_fgsm_worst_best": float(fgsm_worst_best),
+                }
+            )
         metrics = [
             f"epoch={epoch}",
             f"{gen_metric_label}={gen_loss.item():.6f}",
@@ -647,6 +689,14 @@ def main():
             f"heldout_worst_rel_l2={heldout_worst.item():.6f}",
             f"heldout_worst_best={heldout_worst_best.item():.6f}",
         ]
+        if fgsm_should_eval:
+            metrics.extend(
+                [
+                    f"heldout_fgsm_mean_rel_l2={fgsm_mean.item():.6f}",
+                    f"heldout_fgsm_worst_rel_l2={fgsm_worst.item():.6f}",
+                    f"heldout_fgsm_worst_best={fgsm_worst_best.item():.6f}",
+                ]
+            )
         if divergence_operator is not None:
             epoch_metrics.update(
                 {
@@ -676,7 +726,7 @@ def main():
                     f"heldout_worst_pred_div_meanabs_best={heldout_div_worst_best.item():.6f}",
                 ]
             )
-        metrics.append(f"sig_mean={model.sampler.sig.mean().item():.6f}")
+        metrics.append(f"sig_mean={sampler_scale_mean(model.sampler).item():.6f}")
         print(" ".join(metrics))
         log_wandb_metrics(wandb_run, epoch_metrics, step=epoch)
 
@@ -688,6 +738,9 @@ def main():
         history["heldout_mean_rel_l2"].append(float(heldout_mean))
         history["heldout_worst_rel_l2"].append(float(heldout_worst))
         history["heldout_worst_rel_l2_best"].append(float(heldout_worst_best))
+        history["heldout_fgsm_mean_rel_l2"].append(float(fgsm_mean))
+        history["heldout_fgsm_worst_rel_l2"].append(float(fgsm_worst))
+        history["heldout_fgsm_worst_rel_l2_best"].append(float(fgsm_worst_best))
         if divergence_operator is not None:
             history["heldout_mean_pred_div_meanabs"].append(float(heldout_div_mean))
             history["heldout_worst_pred_div_meanabs"].append(float(heldout_div_worst))
@@ -696,7 +749,7 @@ def main():
             history["heldout_mean_pred_div_meanabs"].append(onp.nan)
             history["heldout_worst_pred_div_meanabs"].append(onp.nan)
             history["heldout_worst_pred_div_meanabs_best"].append(onp.nan)
-        history["sig_mean"].append(float(model.sampler.sig.mean()))
+        history["sig_mean"].append(float(sampler_scale_mean(model.sampler)))
 
     metrics_plot_path = (
         Path(args.metrics_plot_path)
@@ -709,6 +762,13 @@ def main():
         f"pred_div_xi={args.pred_div_xi}",
         f"pred_div_region={'all' if args.pred_div_include_boundary else 'interior'}",
         f"boundary_quadrature_rule={args.boundary_quadrature_rule}",
+        f"sampler_type={args.sampler_type}",
+        f"sampler_components={model.sampler.num_components}",
+        f"sampler_temperature={args.sampler_temperature}",
+        f"eval_fgsm={fgsm_enabled}",
+        f"fgsm_epsilon={args.fgsm_epsilon}",
+        f"fgsm_heldout_count={fgsm_count}",
+        f"fgsm_eval_every={fgsm_eval_every}",
         f"epochs={args.epochs}",
         "generator_updates_per_epoch=1",
         f"op_steps={args.op_steps}",

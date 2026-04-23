@@ -137,7 +137,7 @@ class ScalarLegendreTransolver(eqx.Module):
         mlp_ratio,
         key,
     ):
-        key_pre, key_blocks, key_out = jr.split(key, 3)
+        key_pre, key_blocks, key_out, key_placeholder = jr.split(key, 4)
         self.preprocess = ResidualMLP(in_dim=input_locs.shape[1] + 1, hidden_dim=hidden_dim * 2, out_dim=hidden_dim, key=key_pre)
         self.blocks = tuple(
             TransolverBlock(
@@ -151,7 +151,7 @@ class ScalarLegendreTransolver(eqx.Module):
         )
         self.output_norm = eqx.nn.LayerNorm(hidden_dim)
         self.output_linear = eqx.nn.Linear(hidden_dim, 1, key=key_out)
-        self.placeholder = jr.uniform(key_out, (hidden_dim,), minval=-1.0 / hidden_dim, maxval=1.0 / hidden_dim)
+        self.placeholder = jr.uniform(key_placeholder, (hidden_dim,), minval=-1.0 / hidden_dim, maxval=1.0 / hidden_dim)
         self.input_locs = input_locs
         self.input_basis = input_basis
         self.output_locs = output_locs

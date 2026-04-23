@@ -56,8 +56,13 @@ def save_poisson_training_metrics_figure(history, *, save_path, config_lines):
     _plot_series(axes[3], epochs, history["sig_mean"], "sig_mean", color="#7c3aed")
     _finalize_axis(axes[3], "Sampler Scale", "Mean sigma")
 
-    axes[4].axis("off")
-    axes[4].text(
+    _plot_series(axes[4], epochs, history["heldout_fgsm_mean_rel_l2"], "heldout_fgsm_mean_rel_l2", color="#2563eb")
+    _plot_series(axes[4], epochs, history["heldout_fgsm_worst_rel_l2"], "heldout_fgsm_worst_rel_l2", color="#ea580c")
+    _plot_series(axes[4], epochs, history["heldout_fgsm_worst_rel_l2_best"], "heldout_fgsm_worst_best", color="#059669")
+    _finalize_axis(axes[4], "FGSM Held-Out Rel L2", "Relative Error")
+
+    axes[5].axis("off")
+    axes[5].text(
         0.0,
         1.0,
         "\n".join(config_lines),
@@ -66,9 +71,7 @@ def save_poisson_training_metrics_figure(history, *, save_path, config_lines):
         fontsize=11,
         family="monospace",
     )
-    axes[4].set_title("Run Config")
-
-    axes[5].axis("off")
+    axes[5].set_title("Run Config")
 
     fig.suptitle("Poisson Legendre KNO Training Metrics", fontsize=18)
     fig.savefig(save_path, dpi=180, bbox_inches="tight")

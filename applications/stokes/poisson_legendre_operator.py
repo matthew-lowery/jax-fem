@@ -14,23 +14,6 @@ def rel_l2(y_true, y_pred):
     return jnp.linalg.norm(y_true - y_pred) / (jnp.linalg.norm(y_true) + 1e-12)
 
 
-class GaussianSampler(eqx.Module):
-    mu: jax.Array
-    raw_sig: jax.Array
-
-    def __init__(self, *, dim, key):
-        key_mu, key_sig = jr.split(key)
-        self.mu = 0.01 * jr.normal(key_mu, (dim,))
-        self.raw_sig = -2.0 + 0.1 * jr.normal(key_sig, (dim,))
-
-    @property
-    def sig(self):
-        return jax.nn.softplus(self.raw_sig)
-
-    def sample_eps(self, eps):
-        return self.mu + eps * self.sig
-
-
 class MaternC2Kernel(eqx.Module):
     scale: jax.Array
 

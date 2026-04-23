@@ -15,12 +15,12 @@ import jax.numpy as jnp
 import jax.random as jr
 import optax
 
+from local_sampler_utils import build_sampler, sample_noise_batch, sampler_scale_mean
 from poisson_legendre_basis import (
     generate_total_degree_multi_indices,
     legendre_vandermonde,
 )
 from poisson_legendre_operator import (
-    GaussianSampler,
     PointSetKNOHead,
     PoissonLegendreMinimaxModel,
     ScalarLegendreKNO,
@@ -62,6 +62,9 @@ def build_model(
     transolver_heads,
     transolver_slices,
     transolver_mlp_ratio,
+    sampler_type,
+    sampler_components,
+    sampler_temperature,
     quiet_solver,
     key,
 ):
@@ -113,15 +116,21 @@ def build_model(
         raise ValueError(f"Unsupported operator_type={operator_type}")
 
     model = PoissonLegendreMinimaxModel(
-        sampler=GaussianSampler(dim=input_basis.shape[1], key=key_sampler),
+        sampler=build_sampler(
+            sampler_type=sampler_type,
+            dim=input_basis.shape[1],
+            key=key_sampler,
+            num_components=sampler_components,
+            temperature=sampler_temperature,
+        ),
         operator=operator,
     )
     return model, solver, multi_indices, solver_quad_locs, operator_filter
 
 
 @eqx.filter_jit
-def sample_coefs_batch(sampler, eps_batch):
-    return jax.vmap(sampler.sample_eps)(eps_batch)
+def sample_coefs_batch(sampler, noise_batch):
+    return jax.vmap(sampler.sample_eps)(noise_batch)
 
 
 @eqx.filter_jit
@@ -147,6 +156,15 @@ def loss_input_partials(model, coefs_batch, u_true_batch):
 def eval_metrics(model, coefs_batch, u_true_batch):
     rel_errors = jax.vmap(lambda coefs, u_true: rel_l2(u_true, model.predict(coefs)))(coefs_batch, u_true_batch)
     return rel_errors.mean(), rel_errors.max()
+
+
+@eqx.filter_jit
+def fgsm_attack_batch(model, coefs_batch, u_true_batch, epsilon):
+    grad_coefs = jax.vmap(jax.grad(lambda coefs, u_true: rel_l2(u_true, model.predict(coefs)), argnums=0))(
+        coefs_batch,
+        u_true_batch,
+    )
+    return coefs_batch + epsilon * jnp.sign(grad_coefs)
 
 
 def solve_batch(solver, coefs_batch, quiet_solver=False):
@@ -177,11 +195,18 @@ def main():
     parser.add_argument("--transolver-heads", type=int, default=4)
     parser.add_argument("--transolver-slices", type=int, default=32)
     parser.add_argument("--transolver-mlp-ratio", type=int, default=1)
+    parser.add_argument("--sampler-type", choices=("gaussian", "mog"), default="gaussian")
+    parser.add_argument("--sampler-components", type=int, default=4)
+    parser.add_argument("--sampler-temperature", type=float, default=1.0)
     parser.add_argument("--epochs", type=int, default=100)
     parser.add_argument("--op-steps", type=int, default=10)
     parser.add_argument("--batch", type=int, default=2)
     parser.add_argument("--heldout-batch", type=int, default=16)
     parser.add_argument("--heldout-seed", type=int, default=123)
+    parser.add_argument("--eval-fgsm", action="store_true")
+    parser.add_argument("--fgsm-epsilon", type=float, default=0.0)
+    parser.add_argument("--fgsm-heldout-count", type=int, default=0)
+    parser.add_argument("--fgsm-eval-every", type=int, default=1)
     parser.add_argument("--lr-gen", type=float, default=1e-3)
     parser.add_argument("--lr-op", type=float, default=1e-3)
     parser.add_argument("--seed", type=int, default=0)
@@ -193,7 +218,8 @@ def main():
     parser.add_argument("--wandb-name", type=str, default="")
     args = parser.parse_args()
 
-    key = jr.PRNGKey(args.seed)
+    master_key = jr.PRNGKey(args.seed)
+    key_model, key_train = jr.split(master_key)
     model, solver, multi_indices, solver_quad_locs, operator_filter = build_model(
         legendre_degree=args.legendre_degree,
         mesh_nx=args.mesh_nx,
@@ -205,8 +231,11 @@ def main():
         transolver_heads=args.transolver_heads,
         transolver_slices=args.transolver_slices,
         transolver_mlp_ratio=args.transolver_mlp_ratio,
+        sampler_type=args.sampler_type,
+        sampler_components=args.sampler_components,
+        sampler_temperature=args.sampler_temperature,
         quiet_solver=args.quiet_solver,
-        key=key,
+        key=key_model,
     )
 
     optimizer_sampler = optax.chain(optax.clip_by_global_norm(1.0), optax.adam(args.lr_gen))
@@ -214,9 +243,14 @@ def main():
     opt_state_sampler = optimizer_sampler.init(eqx.filter(model.sampler, eqx.is_array))
     opt_state_operator = optimizer_operator.init(eqx.filter(model.operator, operator_filter))
 
-    heldout_eps = jr.normal(jr.PRNGKey(args.heldout_seed), (args.heldout_batch, multi_indices.shape[0]))
-    heldout_coefs = sample_coefs_batch(model.sampler, heldout_eps)
+    heldout_noise = sample_noise_batch(model.sampler, jr.PRNGKey(args.heldout_seed), args.heldout_batch)
+    heldout_coefs = sample_coefs_batch(model.sampler, heldout_noise)
     heldout_u_true = solve_batch(solver, heldout_coefs, quiet_solver=args.quiet_solver)
+    fgsm_enabled = args.eval_fgsm and args.fgsm_epsilon > 0.0 and args.fgsm_heldout_count > 0
+    fgsm_eval_every = max(1, args.fgsm_eval_every)
+    fgsm_count = min(args.fgsm_heldout_count, args.heldout_batch)
+    fgsm_clean_coefs = heldout_coefs[:fgsm_count]
+    fgsm_clean_u_true = heldout_u_true[:fgsm_count]
 
     @eqx.filter_jit
     def train_step_operator(model, opt_state, coefs_batch, u_true_batch):
@@ -234,12 +268,12 @@ def main():
         model = eqx.tree_at(lambda current_model: current_model.operator, model, operator)
         return model, opt_state, loss
 
-    def train_step_sampler(model, opt_state, eps_batch, u_true_batch, solver_vjps):
+    def train_step_sampler(model, opt_state, noise_batch, u_true_batch, solver_vjps):
         sampler_params, sampler_static = eqx.partition(model.sampler, eqx.is_array)
 
         def sample_from_params(current_params):
             current_sampler = eqx.combine(current_params, sampler_static)
-            return jax.vmap(current_sampler.sample_eps)(eps_batch)
+            return jax.vmap(current_sampler.sample_eps)(noise_batch)
 
         coefs_batch, sampler_vjp = jax.vjp(sample_from_params, sampler_params)
         loss, grad_coefs_op, grad_u_true = loss_input_partials(model, coefs_batch, u_true_batch)
@@ -256,6 +290,7 @@ def main():
         return model, opt_state, loss
 
     heldout_worst_best = jnp.inf
+    fgsm_worst_best = jnp.inf
     history = {
         "epoch": [],
         "gen_loss": [],
@@ -263,6 +298,9 @@ def main():
         "heldout_mean_rel_l2": [],
         "heldout_worst_rel_l2": [],
         "heldout_worst_rel_l2_best": [],
+        "heldout_fgsm_mean_rel_l2": [],
+        "heldout_fgsm_worst_rel_l2": [],
+        "heldout_fgsm_worst_rel_l2_best": [],
         "sig_mean": [],
     }
 
@@ -270,6 +308,10 @@ def main():
         "legendre_degree": int(args.legendre_degree),
         "basis_size": int(multi_indices.shape[0]),
         "operator_type": args.operator_type,
+        "sampler_type": args.sampler_type,
+        "sampler_components": int(model.sampler.num_components),
+        "fgsm_enabled": fgsm_enabled,
+        "fgsm_eval_every": fgsm_eval_every,
         "source_quad_points": int(solver_quad_locs.shape[0]),
         "input_points": int(model.operator.input_locs.shape[0]),
         "solution_nodes": int(model.operator.output_locs.shape[0]),
@@ -282,6 +324,10 @@ def main():
         f"input_points={startup_metrics['input_points']}, "
         f"solution_nodes={startup_metrics['solution_nodes']}, "
         f"operator_type={startup_metrics['operator_type']}, "
+        f"sampler_type={startup_metrics['sampler_type']}, "
+        f"sampler_components={startup_metrics['sampler_components']}, "
+        f"fgsm_enabled={startup_metrics['fgsm_enabled']}, "
+        f"fgsm_eval_every={startup_metrics['fgsm_eval_every']}, "
         f"legendre_degree={startup_metrics['legendre_degree']}, "
         f"mesh={startup_metrics['mesh_nx']}x{startup_metrics['mesh_ny']}"
     )
@@ -299,9 +345,9 @@ def main():
     for epoch in range(args.epochs):
         gen_loss = jnp.nan
         op_loss = jnp.nan
-        key, subkey = jr.split(key)
-        eps_batch = jr.normal(subkey, (args.batch, multi_indices.shape[0]))
-        coefs_batch = sample_coefs_batch(model.sampler, eps_batch)
+        key_train, subkey = jr.split(key_train)
+        noise_batch = sample_noise_batch(model.sampler, subkey, args.batch)
+        coefs_batch = sample_coefs_batch(model.sampler, noise_batch)
         if args.freeze_generator:
             u_true_batch = solve_batch(solver, coefs_batch, quiet_solver=args.quiet_solver)
             solver_vjps = None
@@ -316,13 +362,21 @@ def main():
             model, opt_state_sampler, gen_loss = train_step_sampler(
                 model,
                 opt_state_sampler,
-                eps_batch,
+                noise_batch,
                 u_true_batch,
                 solver_vjps,
             )
 
         heldout_mean, heldout_worst = eval_metrics(model, heldout_coefs, heldout_u_true)
         heldout_worst_best = jnp.minimum(heldout_worst_best, heldout_worst)
+        fgsm_mean = jnp.nan
+        fgsm_worst = jnp.nan
+        fgsm_should_eval = fgsm_enabled and (epoch % fgsm_eval_every == 0)
+        if fgsm_should_eval:
+            fgsm_adv_coefs = fgsm_attack_batch(model, fgsm_clean_coefs, fgsm_clean_u_true, args.fgsm_epsilon)
+            fgsm_adv_u_true = solve_batch(solver, fgsm_adv_coefs, quiet_solver=args.quiet_solver)
+            fgsm_mean, fgsm_worst = eval_metrics(model, fgsm_adv_coefs, fgsm_adv_u_true)
+            fgsm_worst_best = jnp.minimum(fgsm_worst_best, fgsm_worst)
         metrics = [
             f"epoch={epoch}",
             f"gen_rel_l2={gen_loss.item():.6f}",
@@ -330,20 +384,37 @@ def main():
             f"heldout_mean_rel_l2={heldout_mean.item():.6f}",
             f"heldout_worst_rel_l2={heldout_worst.item():.6f}",
             f"heldout_worst_best={heldout_worst_best.item():.6f}",
-            f"sig_mean={model.sampler.sig.mean().item():.6f}",
+            f"sig_mean={sampler_scale_mean(model.sampler).item():.6f}",
         ]
+        if fgsm_should_eval:
+            metrics.extend(
+                [
+                    f"heldout_fgsm_mean_rel_l2={fgsm_mean.item():.6f}",
+                    f"heldout_fgsm_worst_rel_l2={fgsm_worst.item():.6f}",
+                    f"heldout_fgsm_worst_best={fgsm_worst_best.item():.6f}",
+                ]
+            )
         print(" ".join(metrics))
+        wandb_metrics = {
+            "epoch": epoch,
+            "gen_rel_l2": float(gen_loss),
+            "op_rel_l2": float(op_loss),
+            "heldout_mean_rel_l2": float(heldout_mean),
+            "heldout_worst_rel_l2": float(heldout_worst),
+            "heldout_worst_best": float(heldout_worst_best),
+            "sig_mean": float(sampler_scale_mean(model.sampler)),
+        }
+        if fgsm_should_eval:
+            wandb_metrics.update(
+                {
+                    "heldout_fgsm_mean_rel_l2": float(fgsm_mean),
+                    "heldout_fgsm_worst_rel_l2": float(fgsm_worst),
+                    "heldout_fgsm_worst_best": float(fgsm_worst_best),
+                }
+            )
         log_wandb_metrics(
             wandb_run,
-            {
-                "epoch": epoch,
-                "gen_rel_l2": float(gen_loss),
-                "op_rel_l2": float(op_loss),
-                "heldout_mean_rel_l2": float(heldout_mean),
-                "heldout_worst_rel_l2": float(heldout_worst),
-                "heldout_worst_best": float(heldout_worst_best),
-                "sig_mean": float(model.sampler.sig.mean()),
-            },
+            wandb_metrics,
             step=epoch,
         )
 
@@ -353,7 +424,10 @@ def main():
         history["heldout_mean_rel_l2"].append(float(heldout_mean))
         history["heldout_worst_rel_l2"].append(float(heldout_worst))
         history["heldout_worst_rel_l2_best"].append(float(heldout_worst_best))
-        history["sig_mean"].append(float(model.sampler.sig.mean()))
+        history["heldout_fgsm_mean_rel_l2"].append(float(fgsm_mean))
+        history["heldout_fgsm_worst_rel_l2"].append(float(fgsm_worst))
+        history["heldout_fgsm_worst_rel_l2_best"].append(float(fgsm_worst_best))
+        history["sig_mean"].append(float(sampler_scale_mean(model.sampler)))
 
     metrics_plot_path = (
         Path(args.metrics_plot_path)
@@ -364,6 +438,13 @@ def main():
         f"legendre_degree={args.legendre_degree}",
         f"basis_size={multi_indices.shape[0]}",
         f"operator_type={args.operator_type}",
+        f"sampler_type={args.sampler_type}",
+        f"sampler_components={model.sampler.num_components}",
+        f"sampler_temperature={args.sampler_temperature}",
+        f"eval_fgsm={fgsm_enabled}",
+        f"fgsm_epsilon={args.fgsm_epsilon}",
+        f"fgsm_heldout_count={fgsm_count}",
+        f"fgsm_eval_every={fgsm_eval_every}",
         f"source_quad_points={solver_quad_locs.shape[0]}",
         f"vertex_points={model.operator.input_locs.shape[0]}",
         f"mesh_nx={args.mesh_nx}",
