@@ -201,7 +201,7 @@ def main():
     parser.add_argument("--epochs", type=int, default=100)
     parser.add_argument("--op-steps", type=int, default=10)
     parser.add_argument("--batch", type=int, default=2)
-    parser.add_argument("--heldout-batch", type=int, default=16)
+    parser.add_argument("--heldout-batch", type=int, default=100)
     parser.add_argument("--heldout-seed", type=int, default=123)
     parser.add_argument("--eval-fgsm", action="store_true")
     parser.add_argument("--fgsm-epsilon", type=float, default=0.0)

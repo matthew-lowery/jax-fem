@@ -403,7 +403,7 @@ def main():
     parser.add_argument("--sampler-type", choices=("gaussian", "mog"), default="gaussian")
     parser.add_argument("--sampler-components", type=int, default=4)
     parser.add_argument("--sampler-temperature", type=float, default=1.0)
-    parser.add_argument("--heldout-batch", type=int, default=16)
+    parser.add_argument("--heldout-batch", type=int, default=100)
     parser.add_argument("--heldout-seed", type=int, default=123)
     parser.add_argument("--eval-fgsm", action="store_true")
     parser.add_argument("--fgsm-epsilon", type=float, default=0.0)
