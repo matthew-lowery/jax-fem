@@ -5,7 +5,6 @@ import contextlib
 import importlib
 import logging
 import os
-import sys
 from pathlib import Path
 
 import equinox as eqx
@@ -18,14 +17,10 @@ import jax.random as jr
 import numpy as onp
 import optax
 
-KNO_EQX_ROOT = Path("/Users/mattlowery/Desktop/code/kno_eqx")
-if str(KNO_EQX_ROOT) not in sys.path:
-    sys.path.insert(0, str(KNO_EQX_ROOT))
-
 from div_stuff.rbf_fd_divergence import build_rbffd_divergence
+from local_kno_utils import create_lifted_module as clm
 from training_metric_plots import save_training_metrics_figure
 from training_wandb import finish_wandb_run, init_wandb_run, log_wandb_metrics
-from utils import create_lifted_module as clm
 
 
 @contextlib.contextmanager
